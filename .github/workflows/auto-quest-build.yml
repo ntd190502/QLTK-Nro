@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 env:
-  OFFICIAL_NRO_PC_URL: https://dl.teamobi.com/drive/get/jp
+  AUTHOR_MOD_PAGE: https://www.mediafire.com/file/d5fb9pc3g9zq893/Nro_Cuong_Le.rar/file
 
 jobs:
   build-manager:
@@ -132,36 +132,59 @@ jobs:
           name: AutoQuest-Assembly-CSharp-${{ github.run_number }}
           path: mod
 
-      - name: Download official NRO PC client
+      - name: Download original Cường Lê mod package
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path work, diagnostics | Out-Null
-          $out = Join-Path $PWD 'work/client-download.bin'
-          Write-Host "Downloading official PC client from $env:OFFICIAL_NRO_PC_URL"
-          $headers = @{ 'User-Agent' = 'Mozilla/5.0 GitHub-Actions AutoQuest-Test-Builder' }
-          Invoke-WebRequest -Uri $env:OFFICIAL_NRO_PC_URL -Headers $headers -MaximumRedirection 10 -OutFile $out
-          if (-not (Test-Path $out)) { throw 'Official client download did not create a file.' }
-          $size = (Get-Item $out).Length
-          if ($size -lt 1MB) {
-            Get-Content $out -Raw -ErrorAction SilentlyContinue | Set-Content -Encoding UTF8 diagnostics/download-response.txt
-            throw "Official client download is unexpectedly small: $size bytes"
+          $pageFile = Join-Path $PWD 'work/mediafire-page.html'
+          $out = Join-Path $PWD 'work/Nro_Cuong_Le.rar'
+          $headers = @{ 'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36' }
+
+          Write-Host "Resolving author package from: $env:AUTHOR_MOD_PAGE"
+          Invoke-WebRequest -Uri $env:AUTHOR_MOD_PAGE -Headers $headers -MaximumRedirection 10 -OutFile $pageFile
+          $html = Get-Content $pageFile -Raw
+          $matches = [regex]::Matches($html, 'https?:\/\/[^"''<> ]+mediafire\.com\/[^"''<> ]+')
+          $direct = $null
+          foreach ($m in $matches) {
+            $candidate = [System.Net.WebUtility]::HtmlDecode($m.Value).Replace('&amp;','&')
+            if ($candidate -match 'download[^/]*\.mediafire\.com|download\.mediafire\.com') {
+              $direct = $candidate
+              break
+            }
           }
-          Write-Host "Downloaded $size bytes"
+
+          if (-not $direct) {
+            $button = [regex]::Match($html, 'id="downloadButton"[^>]*href="([^"]+)"')
+            if ($button.Success) { $direct = [System.Net.WebUtility]::HtmlDecode($button.Groups[1].Value).Replace('&amp;','&') }
+          }
+          if (-not $direct) {
+            $button2 = [regex]::Match($html, 'href="([^"]+)"[^>]*id="downloadButton"')
+            if ($button2.Success) { $direct = [System.Net.WebUtility]::HtmlDecode($button2.Groups[1].Value).Replace('&amp;','&') }
+          }
+          if (-not $direct) {
+            Copy-Item $pageFile diagnostics/mediafire-page.html -Force
+            throw 'Could not resolve MediaFire direct download URL from author package page.'
+          }
+
+          $direct | Set-Content -Encoding UTF8 diagnostics/resolved-download-url.txt
+          Write-Host 'MediaFire direct URL resolved; downloading package...'
+          Invoke-WebRequest -Uri $direct -Headers $headers -Referer $env:AUTHOR_MOD_PAGE -MaximumRedirection 10 -OutFile $out
+          if (-not (Test-Path $out)) { throw 'Author package download did not create a file.' }
+          $size = (Get-Item $out).Length
+          if ($size -lt 5MB) { throw "Author package is unexpectedly small: $size bytes" }
+          Write-Host "Downloaded author package: $size bytes"
           Get-FileHash $out -Algorithm SHA256 | Format-List | Out-File diagnostics/client-download-sha256.txt
 
-      - name: Extract official client
+      - name: Extract author client
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $src = Join-Path $PWD 'work/client-download.bin'
+          $src = Join-Path $PWD 'work/Nro_Cuong_Le.rar'
           $dest = Join-Path $PWD 'work/extracted'
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
-
-          # 7-Zip is preinstalled on windows-latest and handles ZIP/7z/RAR and many SFX EXEs.
           & 7z x $src "-o$dest" -y | Tee-Object -FilePath diagnostics/7zip-extract.log
-          if ($LASTEXITCODE -ne 0) { throw "7-Zip failed to extract official client (exit $LASTEXITCODE)." }
-
+          if ($LASTEXITCODE -ne 0) { throw "7-Zip failed to extract author package (exit $LASTEXITCODE)." }
           $files = Get-ChildItem $dest -Recurse -File
           "Extracted files: $($files.Count)" | Out-File diagnostics/extracted-summary.txt
           $files | Select-Object FullName, Length | Format-Table -AutoSize | Out-File diagnostics/extracted-files.txt -Width 300
@@ -177,9 +200,7 @@ jobs:
           $target = Get-ChildItem $extract -Recurse -File -Filter 'Assembly-CSharp.dll' |
             Where-Object { $_.DirectoryName -match '[\\/]Managed$' } |
             Select-Object -First 1
-          if (-not $target) {
-            throw 'Downloaded PC package does not contain a Unity Managed/Assembly-CSharp.dll. It is not compatible with this mod build.'
-          }
+          if (-not $target) { throw 'Author package does not contain Managed/Assembly-CSharp.dll.' }
 
           $dataDir = $target.Directory.Parent
           $clientRoot = $dataDir.Parent.FullName
@@ -187,10 +208,10 @@ jobs:
           Write-Host "Detected managed DLL: $($target.FullName)"
 
           $exe = Get-ChildItem $clientRoot -File -Filter '*.exe' |
-            Where-Object { $_.Name -notmatch '^(UnityCrashHandler|crashpad_handler)' } |
-            Sort-Object Length -Descending |
+            Where-Object { $_.Name -notmatch '^(UnityCrashHandler|crashpad_handler|Update)' } |
+            Sort-Object @{Expression={ if ($_.Name -match '^Nro_?244\.exe$') { 0 } else { 1 } }}, @{Expression='Length';Descending=$true} |
             Select-Object -First 1
-          if (-not $exe) { throw "No game EXE found next to detected *_Data directory: $clientRoot" }
+          if (-not $exe) { throw "No game EXE found next to *_Data directory: $clientRoot" }
 
           $originalHash = (Get-FileHash $target.FullName -Algorithm SHA256).Hash
           $modHash = (Get-FileHash $modDll -Algorithm SHA256).Hash
@@ -201,9 +222,8 @@ jobs:
 
           New-Item -ItemType Directory -Force -Path package | Out-Null
           Copy-Item (Join-Path $clientRoot '*') package -Recurse -Force
-
-          $gameExe = Get-ChildItem package -File -Filter $exe.Name | Select-Object -First 1
-          if (-not $gameExe) { throw 'Game EXE was lost while creating package.' }
+          $gameExe = Join-Path $PWD ("package/" + $exe.Name)
+          if (-not (Test-Path $gameExe)) { throw 'Game EXE was lost while creating package.' }
 
           @"
           AUTO QUEST 1-7 - FULL CLIENT TEST
@@ -221,7 +241,7 @@ jobs:
           Branch: $env:GITHUB_REF_NAME
           Commit: $env:GITHUB_SHA
           Run: $env:GITHUB_RUN_NUMBER
-          Official client source: $env:OFFICIAL_NRO_PC_URL
+          Base package: Cường Lê author MediaFire package linked by cuongle4399/web-mod-nro
           Original Assembly SHA256: $originalHash
           AutoQuest Assembly SHA256: $modHash
           Game EXE: $($exe.Name)
@@ -238,7 +258,7 @@ jobs:
         run: |
           $dll = Get-ChildItem package -Recurse -File -Filter 'Assembly-CSharp.dll' | Where-Object { $_.DirectoryName -match '[\\/]Managed$' } | Select-Object -First 1
           if (-not $dll) { throw 'Final package has no Managed/Assembly-CSharp.dll.' }
-          $exe = Get-ChildItem package -File -Filter '*.exe' | Where-Object { $_.Name -notmatch '^(UnityCrashHandler|crashpad_handler)' } | Select-Object -First 1
+          $exe = Get-ChildItem package -File -Filter '*.exe' | Where-Object { $_.Name -notmatch '^(UnityCrashHandler|crashpad_handler|Update)' } | Select-Object -First 1
           if (-not $exe) { throw 'Final package has no runnable game EXE.' }
           $modHash = (Get-FileHash 'mod/Assembly-CSharp.dll' -Algorithm SHA256).Hash
           $pkgHash = (Get-FileHash $dll.FullName -Algorithm SHA256).Hash
@@ -305,16 +325,10 @@ jobs:
           $logDir = Join-Path $root 'Test-Logs'
           $launcherLog = Join-Path $logDir 'launcher.log'
           New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-
-          function Log([string]$text) {
-            $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $text"
-            $line | Tee-Object -FilePath $launcherLog -Append
-          }
-
+          function Log([string]$text) { "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $text" | Tee-Object -FilePath $launcherLog -Append }
           if (-not (Test-Path $modDll)) { throw "Missing AutoQuest-Mod\Assembly-CSharp.dll" }
           $managerExe = Get-ChildItem -Path $managerDir -Filter '*.exe' -File | Where-Object { $_.Name -notmatch '^(createdump|Update)\.exe$' } | Select-Object -First 1
           if (-not $managerExe) { throw 'QLTK Manager EXE was not found in package.' }
-
           function Patch-ClientAssemblies {
             if (-not (Test-Path $clientRoot)) { return 0 }
             $targets = @(Get-ChildItem -Path $clientRoot -Filter 'Assembly-CSharp.dll' -File -Recurse -ErrorAction SilentlyContinue)
@@ -331,7 +345,6 @@ jobs:
             }
             return $patched
           }
-
           Patch-ClientAssemblies | Out-Null
           Start-Process -FilePath $managerExe.FullName -WorkingDirectory $managerDir
           $deadline = (Get-Date).AddMinutes(10)
