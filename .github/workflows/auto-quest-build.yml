@@ -1,0 +1,197 @@
+name: Auto Quest Branch Build
+
+on:
+  push:
+    branches:
+      - feature/auto-quest-learning-1-7
+  pull_request:
+    branches:
+      - master
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AUTHOR_MOD_PAGE: https://www.mediafire.com/file/d5fb9pc3g9zq893/Nro_Cuong_Le.rar/file
+
+jobs:
+  build-full-client:
+    name: Build Auto Quest full client ZIP
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Auto Quest branch
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build Auto Quest Assembly-CSharp
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path work, diagnostics | Out-Null
+          dotnet restore "Mod Nro Pc/ModNroPc.csproj" 2>&1 | Tee-Object -FilePath diagnostics/mod-restore.log
+          dotnet build "Mod Nro Pc/ModNroPc.csproj" -c Release --no-restore 2>&1 | Tee-Object -FilePath diagnostics/mod-build.log
+          if ($LASTEXITCODE -ne 0) { throw 'Auto Quest Assembly-CSharp build failed.' }
+          $dll = Get-ChildItem -Path "Mod Nro Pc/bin/Release" -Recurse -Filter "Assembly-CSharp.dll" | Select-Object -First 1
+          if (-not $dll) { throw 'Assembly-CSharp.dll was not produced.' }
+          Copy-Item $dll.FullName work/Assembly-CSharp.dll -Force
+          Get-FileHash work/Assembly-CSharp.dll -Algorithm SHA256 | Format-List | Out-File diagnostics/autoquest-assembly-sha256.txt
+
+      - name: Resolve MediaFire author package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pageFile = Join-Path $PWD 'work/mediafire-page.html'
+          $headers = @{ 'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36' }
+          Invoke-WebRequest -Uri $env:AUTHOR_MOD_PAGE -Headers $headers -MaximumRedirection 10 -OutFile $pageFile
+          $html = Get-Content $pageFile -Raw
+
+          $direct = $null
+          $patterns = @(
+            'href="(https?://download[^\"]*mediafire\.com/[^\"]+)"',
+            'href="(https?://[^\"]+)"[^>]*id="downloadButton"',
+            'id="downloadButton"[^>]*href="(https?://[^\"]+)"'
+          )
+          foreach ($pattern in $patterns) {
+            $m = [regex]::Match($html, $pattern)
+            if ($m.Success) { $direct = $m.Groups[1].Value; break }
+          }
+          if (-not $direct) {
+            Copy-Item $pageFile diagnostics/mediafire-page.html -Force
+            throw 'Could not resolve MediaFire direct download URL.'
+          }
+          $direct = [System.Net.WebUtility]::HtmlDecode($direct).Replace('&amp;','&')
+          $direct | Set-Content -Encoding UTF8 diagnostics/resolved-download-url.txt
+
+          $downloadHeaders = @{
+            'User-Agent' = $headers['User-Agent']
+            'Referer' = $env:AUTHOR_MOD_PAGE
+          }
+          Invoke-WebRequest -Uri $direct -Headers $downloadHeaders -MaximumRedirection 10 -OutFile work/Nro_Cuong_Le.rar
+          $size = (Get-Item work/Nro_Cuong_Le.rar).Length
+          if ($size -lt 5MB) { throw "Downloaded package is unexpectedly small: $size bytes" }
+          "Downloaded bytes: $size" | Set-Content diagnostics/download-size.txt
+          Get-FileHash work/Nro_Cuong_Le.rar -Algorithm SHA256 | Format-List | Out-File diagnostics/author-package-sha256.txt
+
+      - name: Extract author client
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path work/extracted | Out-Null
+          & 7z x work/Nro_Cuong_Le.rar "-owork/extracted" -y 2>&1 | Tee-Object -FilePath diagnostics/7zip-extract.log
+          if ($LASTEXITCODE -ne 0) { throw "7-Zip extraction failed with code $LASTEXITCODE" }
+          $files = Get-ChildItem work/extracted -Recurse -File
+          "Extracted files: $($files.Count)" | Set-Content diagnostics/extracted-summary.txt
+          $files | Select-Object FullName,Length | Format-Table -AutoSize | Out-File diagnostics/extracted-files.txt -Width 300
+
+      - name: Find Nro client and inject Auto Quest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $targets = @(Get-ChildItem work/extracted -Recurse -File -Filter 'Assembly-CSharp.dll' | Where-Object { $_.DirectoryName -match '[\\/]Managed$' })
+          if ($targets.Count -eq 0) { throw 'No Unity Managed/Assembly-CSharp.dll found in author package.' }
+
+          $selectedTarget = $null
+          $selectedRoot = $null
+          $selectedExe = $null
+
+          foreach ($target in $targets) {
+            $dataDir = $target.Directory.Parent
+            $root = $dataDir.Parent.FullName
+            $preferred = Join-Path $root 'Nro_244.exe'
+            if (Test-Path $preferred) {
+              $selectedTarget = $target
+              $selectedRoot = $root
+              $selectedExe = Get-Item $preferred
+              break
+            }
+          }
+
+          if (-not $selectedTarget) {
+            foreach ($target in $targets) {
+              $dataDir = $target.Directory.Parent
+              $root = $dataDir.Parent.FullName
+              $exe = Get-ChildItem $root -File -Filter '*.exe' | Where-Object { $_.Name -notmatch '^(UnityCrashHandler|crashpad_handler|Update)' } | Sort-Object Length -Descending | Select-Object -First 1
+              if ($exe) {
+                $selectedTarget = $target
+                $selectedRoot = $root
+                $selectedExe = $exe
+                break
+              }
+            }
+          }
+
+          if (-not $selectedTarget -or -not $selectedExe) { throw 'Could not locate runnable NRO client beside a Managed assembly.' }
+
+          $modDll = Resolve-Path work/Assembly-CSharp.dll
+          $originalHash = (Get-FileHash $selectedTarget.FullName -Algorithm SHA256).Hash
+          $modHash = (Get-FileHash $modDll -Algorithm SHA256).Hash
+          Copy-Item $selectedTarget.FullName "$($selectedTarget.FullName).original.bak" -Force
+          Copy-Item $modDll $selectedTarget.FullName -Force
+          if ((Get-FileHash $selectedTarget.FullName -Algorithm SHA256).Hash -ne $modHash) { throw 'Assembly patch hash validation failed.' }
+
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item (Join-Path $selectedRoot '*') package -Recurse -Force
+          $packagedExe = Join-Path (Resolve-Path package) $selectedExe.Name
+          if (-not (Test-Path $packagedExe)) { throw 'Runnable NRO executable missing after packaging.' }
+
+          @"
+          AUTO QUEST 1-7 - READY TO TEST
+
+          Cach chay:
+          1. Giai nen toan bo ZIP.
+          2. Chay file: $($selectedExe.Name)
+          3. Dang nhap tai khoan dang o nhiem vu dau.
+          4. Auto Quest se tu quan sat, tu hoc va luu mapping.
+
+          Du lieu hoc:
+          Data\AutoQuest\quest_profiles.json
+          Data\AutoQuest\quest_learning.log
+
+          Run: $env:GITHUB_RUN_NUMBER
+          Commit: $env:GITHUB_SHA
+          Original Assembly SHA256: $originalHash
+          AutoQuest Assembly SHA256: $modHash
+          "@ | Set-Content -Encoding UTF8 package/README-AUTOQUEST.txt
+
+          @"
+          game_exe=$($selectedExe.Name)
+          client_root=$selectedRoot
+          original_assembly_sha256=$originalHash
+          autoquest_assembly_sha256=$modHash
+          "@ | Set-Content -Encoding UTF8 diagnostics/package-info.txt
+
+      - name: Validate final ZIP contents
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem package -Recurse -File -Filter 'Assembly-CSharp.dll' | Where-Object { $_.DirectoryName -match '[\\/]Managed$' } | Select-Object -First 1
+          if (-not $dll) { throw 'Final package has no Managed/Assembly-CSharp.dll.' }
+          $exe = Get-ChildItem package -File -Filter '*.exe' | Where-Object { $_.Name -notmatch '^(UnityCrashHandler|crashpad_handler|Update)' } | Select-Object -First 1
+          if (-not $exe) { throw 'Final package has no game EXE.' }
+          $expected = (Get-FileHash work/Assembly-CSharp.dll -Algorithm SHA256).Hash
+          $actual = (Get-FileHash $dll.FullName -Algorithm SHA256).Hash
+          if ($expected -ne $actual) { throw 'Final package DLL is not the Auto Quest DLL.' }
+          Write-Host "READY TO TEST: $($exe.Name)"
+
+      - name: Upload Auto Quest full client
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoQuest-FULL-CLIENT-${{ github.run_number }}
+          path: package/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoQuest-FULL-CLIENT-Diagnostics-${{ github.run_number }}
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 14

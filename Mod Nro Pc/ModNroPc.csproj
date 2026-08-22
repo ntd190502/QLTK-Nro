@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>Assembly-CSharp</AssemblyName>
+    <RootNamespace></RootNamespace>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net472" Version="1.0.3" PrivateAssets="all" />
+    <PackageReference Include="Unity3D.UnityEngine" Version="2018.3.5.1" />
+  </ItemGroup>
+
+  <!--
+    The repository contains ILSpy/decompiled Unity source. Two source constructs do not
+    compile against the public Unity reference package even though they are valid in the
+    original player environment: a named Texture2D constructor argument and AutoQuest
+    calling a helper that is private in the decompiled AutoTrain source.
+    Generate build-only compatibility copies instead of rewriting the original game files.
+  -->
+  <ItemGroup>
+    <Compile Remove="Image.cs" />
+    <Compile Remove="Mod.CuongLe\AutoQuestCL.cs" />
+    <Compile Include="$(IntermediateOutputPath)Image.Build.cs" />
+    <Compile Include="$(IntermediateOutputPath)AutoQuestCL.Build.cs" />
+  </ItemGroup>
+
+  <Target Name="GenerateLegacyUnityBuildSources" BeforeTargets="CoreCompile">
+    <PropertyGroup>
+      <_ImageSource>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)\Image.cs'))</_ImageSource>
+      <_ImagePatched>$([System.String]::Copy('$(_ImageSource)').Replace('mipmap: false', 'false'))</_ImagePatched>
+      <_QuestSource>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)\Mod.CuongLe\AutoQuestCL.cs'))</_QuestSource>
+      <_QuestPatched>$([System.String]::Copy('$(_QuestSource)').Replace('AutoTrainCL.GetCurrentMapMobList()', 'AutoQuestBuildCompat.GetCurrentMapMobList()'))</_QuestPatched>
+    </PropertyGroup>
+    <WriteLinesToFile File="$(IntermediateOutputPath)Image.Build.cs" Lines="$(_ImagePatched)" Overwrite="true" Encoding="UTF-8" />
+    <WriteLinesToFile File="$(IntermediateOutputPath)AutoQuestCL.Build.cs" Lines="$(_QuestPatched)" Overwrite="true" Encoding="UTF-8" />
+  </Target>
+</Project>

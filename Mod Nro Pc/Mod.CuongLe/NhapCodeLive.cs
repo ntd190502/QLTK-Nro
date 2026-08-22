@@ -28,6 +28,9 @@ internal class NhapCodeLive
 
 	public void update()
 	{
+		// Auto Quest uses this existing update hook so MainMod does not need to be rewritten.
+		AutoQuestCL.Update();
+
 		if (!isEnable || MainXmapCL.isXmaping || string.IsNullOrEmpty(code))
 		{
 			return;
