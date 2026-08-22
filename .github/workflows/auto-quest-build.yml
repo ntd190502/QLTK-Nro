@@ -23,38 +23,92 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Restore
+      - name: Restore manager
         run: dotnet restore "QLTK Nro Pro/QLTK Nro Pro.csproj"
 
-      - name: Build
+      - name: Build manager
         run: dotnet build "QLTK Nro Pro/QLTK Nro Pro.csproj" -c Release --no-restore
 
       - name: Publish self-contained Windows x64
         run: dotnet publish "QLTK Nro Pro/QLTK Nro Pro.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:DebugType=None -p:DebugSymbols=false -o "artifacts/QLTK-Manager"
 
-      - name: Include Auto Quest learning source and build info
+      - name: Upload manager artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoQuest-Manager-${{ github.run_number }}
+          path: artifacts/QLTK-Manager/
+          if-no-files-found: error
+          retention-days: 14
+
+  build-mod:
+    name: Build Auto Quest Assembly-CSharp
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Auto Quest branch
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore mod compiler project
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path "artifacts/AutoQuest-Source" | Out-Null
-          Copy-Item "Mod Nro Pc/Mod.CuongLe/AutoQuestCL.cs" "artifacts/AutoQuest-Source/AutoQuestCL.cs"
-          Copy-Item "Mod Nro Pc/Mod.CuongLe/QuestLearningStore.cs" "artifacts/AutoQuest-Source/QuestLearningStore.cs"
-          Copy-Item "Mod Nro Pc/Mod.CuongLe/NhapCodeLive.cs" "artifacts/AutoQuest-Source/NhapCodeLive.cs"
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          dotnet restore "Mod Nro Pc/ModNroPc.csproj" 2>&1 | Tee-Object -FilePath "artifacts/mod-restore.log"
+
+      - name: Compile Assembly-CSharp
+        id: compile_mod
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          dotnet build "Mod Nro Pc/ModNroPc.csproj" -c Release --no-restore 2>&1 | Tee-Object -FilePath "artifacts/mod-build.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Collect mod output
+        if: steps.compile_mod.outcome == 'success'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "artifacts/AutoQuest-Mod" | Out-Null
+          $dll = Get-ChildItem -Path "Mod Nro Pc/bin/Release" -Recurse -Filter "Assembly-CSharp.dll" | Select-Object -First 1
+          if (-not $dll) { throw "Assembly-CSharp.dll was not produced" }
+          Copy-Item $dll.FullName "artifacts/AutoQuest-Mod/Assembly-CSharp.dll"
+          if (Test-Path ($dll.FullName.Replace('.dll','.pdb'))) {
+            Copy-Item ($dll.FullName.Replace('.dll','.pdb')) "artifacts/AutoQuest-Mod/Assembly-CSharp.pdb"
+          }
           @"
           Branch: $env:GITHUB_REF_NAME
           Commit: $env:GITHUB_SHA
           Built: $(Get-Date -Format o)
+          Output: Assembly-CSharp.dll
+          Purpose: replacement managed game assembly containing Auto Quest learning code.
+          "@ | Set-Content -Encoding UTF8 "artifacts/AutoQuest-Mod/BUILD-INFO.txt"
 
-          IMPORTANT:
-          QLTK Nro Pro is a normal .NET 8 WinForms project and is built into QLTK-Manager.
-          The repository's 'Mod Nro Pc' folder is decompiled Unity/Assembly-CSharp source and currently has no .csproj/Unity project or referenced Unity managed DLL set in this repository.
-          Therefore GitHub Actions cannot yet produce a trustworthy modified NRO game executable from those source files alone.
-          The AutoQuest source is included separately in this artifact until a reproducible Mod Nro Pc build project is added.
-          "@ | Set-Content -Encoding UTF8 "artifacts/BUILD-INFO.txt"
-
-      - name: Upload branch artifact
+      - name: Upload compiled mod
+        if: steps.compile_mod.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: AutoQuest-Branch-${{ github.run_number }}
-          path: artifacts/
+          name: AutoQuest-Assembly-CSharp-${{ github.run_number }}
+          path: artifacts/AutoQuest-Mod/
           if-no-files-found: error
           retention-days: 14
+
+      - name: Upload compiler diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoQuest-Compile-Logs-${{ github.run_number }}
+          path: |
+            artifacts/mod-restore.log
+            artifacts/mod-build.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail if mod did not compile
+        if: steps.compile_mod.outcome != 'success'
+        shell: pwsh
+        run: |
+          Write-Error "Mod compilation failed. See AutoQuest-Compile-Logs artifact for exact missing/incompatible references."
+          exit 1
