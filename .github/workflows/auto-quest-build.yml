@@ -13,6 +13,9 @@ on:
 permissions:
   contents: read
 
+env:
+  OFFICIAL_NRO_PC_URL: https://dl.teamobi.com/drive/get/jp
+
 jobs:
   build-manager:
     name: Build QLTK Manager (Windows x64)
@@ -117,8 +120,150 @@ jobs:
           Write-Error "Mod compilation failed. See AutoQuest-Compile-Logs artifact for exact missing/incompatible references."
           exit 1
 
+  package-full-client:
+    name: Package full NRO Auto Quest client
+    needs: [build-mod]
+    runs-on: windows-latest
+
+    steps:
+      - name: Download Auto Quest assembly
+        uses: actions/download-artifact@v4
+        with:
+          name: AutoQuest-Assembly-CSharp-${{ github.run_number }}
+          path: mod
+
+      - name: Download official NRO PC client
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path work, diagnostics | Out-Null
+          $out = Join-Path $PWD 'work/client-download.bin'
+          Write-Host "Downloading official PC client from $env:OFFICIAL_NRO_PC_URL"
+          $headers = @{ 'User-Agent' = 'Mozilla/5.0 GitHub-Actions AutoQuest-Test-Builder' }
+          Invoke-WebRequest -Uri $env:OFFICIAL_NRO_PC_URL -Headers $headers -MaximumRedirection 10 -OutFile $out
+          if (-not (Test-Path $out)) { throw 'Official client download did not create a file.' }
+          $size = (Get-Item $out).Length
+          if ($size -lt 1MB) {
+            Get-Content $out -Raw -ErrorAction SilentlyContinue | Set-Content -Encoding UTF8 diagnostics/download-response.txt
+            throw "Official client download is unexpectedly small: $size bytes"
+          }
+          Write-Host "Downloaded $size bytes"
+          Get-FileHash $out -Algorithm SHA256 | Format-List | Out-File diagnostics/client-download-sha256.txt
+
+      - name: Extract official client
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = Join-Path $PWD 'work/client-download.bin'
+          $dest = Join-Path $PWD 'work/extracted'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+          # 7-Zip is preinstalled on windows-latest and handles ZIP/7z/RAR and many SFX EXEs.
+          & 7z x $src "-o$dest" -y | Tee-Object -FilePath diagnostics/7zip-extract.log
+          if ($LASTEXITCODE -ne 0) { throw "7-Zip failed to extract official client (exit $LASTEXITCODE)." }
+
+          $files = Get-ChildItem $dest -Recurse -File
+          "Extracted files: $($files.Count)" | Out-File diagnostics/extracted-summary.txt
+          $files | Select-Object FullName, Length | Format-Table -AutoSize | Out-File diagnostics/extracted-files.txt -Width 300
+
+      - name: Locate Unity client and patch Auto Quest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $extract = Join-Path $PWD 'work/extracted'
+          $modDll = Join-Path $PWD 'mod/Assembly-CSharp.dll'
+          if (-not (Test-Path $modDll)) { throw 'Compiled Auto Quest Assembly-CSharp.dll is missing.' }
+
+          $target = Get-ChildItem $extract -Recurse -File -Filter 'Assembly-CSharp.dll' |
+            Where-Object { $_.DirectoryName -match '[\\/]Managed$' } |
+            Select-Object -First 1
+          if (-not $target) {
+            throw 'Downloaded PC package does not contain a Unity Managed/Assembly-CSharp.dll. It is not compatible with this mod build.'
+          }
+
+          $dataDir = $target.Directory.Parent
+          $clientRoot = $dataDir.Parent.FullName
+          Write-Host "Detected client root: $clientRoot"
+          Write-Host "Detected managed DLL: $($target.FullName)"
+
+          $exe = Get-ChildItem $clientRoot -File -Filter '*.exe' |
+            Where-Object { $_.Name -notmatch '^(UnityCrashHandler|crashpad_handler)' } |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+          if (-not $exe) { throw "No game EXE found next to detected *_Data directory: $clientRoot" }
+
+          $originalHash = (Get-FileHash $target.FullName -Algorithm SHA256).Hash
+          $modHash = (Get-FileHash $modDll -Algorithm SHA256).Hash
+          Copy-Item $target.FullName "$($target.FullName).original.bak" -Force
+          Copy-Item $modDll $target.FullName -Force
+          $patchedHash = (Get-FileHash $target.FullName -Algorithm SHA256).Hash
+          if ($patchedHash -ne $modHash) { throw 'Patched Assembly-CSharp.dll hash does not match compiled mod DLL.' }
+
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item (Join-Path $clientRoot '*') package -Recurse -Force
+
+          $gameExe = Get-ChildItem package -File -Filter $exe.Name | Select-Object -First 1
+          if (-not $gameExe) { throw 'Game EXE was lost while creating package.' }
+
+          @"
+          AUTO QUEST 1-7 - FULL CLIENT TEST
+
+          CACH TEST:
+          1. Giai nen toan bo artifact ZIP.
+          2. Mo file game EXE: $($exe.Name)
+          3. Dang nhap tai khoan dang o nhiem vu dau de Auto Quest hoc va chay.
+
+          FILE TU HOC (sau khi game chay):
+          Data\AutoQuest\quest_profiles.json
+          Data\AutoQuest\quest_learning.log
+
+          THONG TIN BUILD:
+          Branch: $env:GITHUB_REF_NAME
+          Commit: $env:GITHUB_SHA
+          Run: $env:GITHUB_RUN_NUMBER
+          Official client source: $env:OFFICIAL_NRO_PC_URL
+          Original Assembly SHA256: $originalHash
+          AutoQuest Assembly SHA256: $modHash
+          Game EXE: $($exe.Name)
+          "@ | Set-Content -Encoding UTF8 package/README-AUTOQUEST.txt
+
+          @"
+          game_exe=$($exe.Name)
+          original_assembly_sha256=$originalHash
+          autoquest_assembly_sha256=$modHash
+          "@ | Set-Content -Encoding UTF8 diagnostics/package-info.txt
+
+      - name: Validate full client package
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem package -Recurse -File -Filter 'Assembly-CSharp.dll' | Where-Object { $_.DirectoryName -match '[\\/]Managed$' } | Select-Object -First 1
+          if (-not $dll) { throw 'Final package has no Managed/Assembly-CSharp.dll.' }
+          $exe = Get-ChildItem package -File -Filter '*.exe' | Where-Object { $_.Name -notmatch '^(UnityCrashHandler|crashpad_handler)' } | Select-Object -First 1
+          if (-not $exe) { throw 'Final package has no runnable game EXE.' }
+          $modHash = (Get-FileHash 'mod/Assembly-CSharp.dll' -Algorithm SHA256).Hash
+          $pkgHash = (Get-FileHash $dll.FullName -Algorithm SHA256).Hash
+          if ($modHash -ne $pkgHash) { throw 'Final package contains wrong Assembly-CSharp.dll.' }
+          Write-Host "FULL CLIENT READY: $($exe.Name)"
+
+      - name: Upload full ready-to-run client
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoQuest-FULL-CLIENT-${{ github.run_number }}
+          path: package/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload full-client diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoQuest-FULL-CLIENT-Diagnostics-${{ github.run_number }}
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
+
   package-test:
-    name: Package one-click Auto Quest test ZIP
+    name: Package QLTK-assisted Auto Quest test ZIP
     needs: [build-manager, build-mod]
     runs-on: windows-latest
 
@@ -135,7 +280,7 @@ jobs:
           name: AutoQuest-Assembly-CSharp-${{ github.run_number }}
           path: package/AutoQuest-Mod
 
-      - name: Create one-click launcher
+      - name: Create fallback launcher
         shell: pwsh
         run: |
           @'
@@ -167,7 +312,6 @@ jobs:
           }
 
           if (-not (Test-Path $modDll)) { throw "Missing AutoQuest-Mod\Assembly-CSharp.dll" }
-
           $managerExe = Get-ChildItem -Path $managerDir -Filter '*.exe' -File | Where-Object { $_.Name -notmatch '^(createdump|Update)\.exe$' } | Select-Object -First 1
           if (-not $managerExe) { throw 'QLTK Manager EXE was not found in package.' }
 
@@ -178,97 +322,26 @@ jobs:
             foreach ($target in $targets) {
               try {
                 $backup = "$($target.FullName).autoquest-original.bak"
-                if (-not (Test-Path $backup)) {
-                  Copy-Item $target.FullName $backup -Force
-                  Log "Backed up original: $backup"
-                }
+                if (-not (Test-Path $backup)) { Copy-Item $target.FullName $backup -Force }
                 $srcHash = (Get-FileHash $modDll -Algorithm SHA256).Hash
                 $dstHash = (Get-FileHash $target.FullName -Algorithm SHA256).Hash
-                if ($srcHash -ne $dstHash) {
-                  Copy-Item $modDll $target.FullName -Force
-                  Log "Patched Auto Quest DLL: $($target.FullName)"
-                }
+                if ($srcHash -ne $dstHash) { Copy-Item $modDll $target.FullName -Force }
                 $patched++
-              } catch {
-                Log "Patch retry needed for $($target.FullName): $($_.Exception.Message)"
-              }
+              } catch { Log "Patch retry: $($_.Exception.Message)" }
             }
             return $patched
           }
 
-          Log "Auto Quest one-click launcher started. Client cache: $clientRoot"
-          $before = Patch-ClientAssemblies
-          if ($before -gt 0) { Log "Found and prepared $before client assembly target(s) before manager start." }
-
-          Log "Starting QLTK Manager: $($managerExe.FullName)"
+          Patch-ClientAssemblies | Out-Null
           Start-Process -FilePath $managerExe.FullName -WorkingDirectory $managerDir
-
-          # The original manager uses %TEMP%\cuongle4399\mod 244. Keep watching so
-          # a freshly extracted client is patched automatically without manual DLL replacement.
           $deadline = (Get-Date).AddMinutes(10)
-          $everPatched = $before -gt 0
-          while ((Get-Date) -lt $deadline) {
-            $count = Patch-ClientAssemblies
-            if ($count -gt 0) { $everPatched = $true }
-            Start-Sleep -Milliseconds 500
-          }
-
-          if (-not $everPatched) {
-            Log 'No client Assembly-CSharp.dll was found within 10 minutes.'
-            Write-Host ''
-            Write-Host 'QLTK Manager opened, but its NRO client cache was not created yet.'
-            Write-Host 'Open/start one NRO account in QLTK, then run START-AUTOQUEST.bat again.'
-            exit 2
-          }
-
-          Log 'Auto Quest patch watcher finished successfully.'
+          while ((Get-Date) -lt $deadline) { Patch-ClientAssemblies | Out-Null; Start-Sleep -Milliseconds 500 }
           '@ | Set-Content -Encoding UTF8 "package/Start-AutoQuest.ps1"
 
-          @'
-          AUTO QUEST 1-7 - TEST PACKAGE
-
-          CACH DUNG:
-          1. Giai nen toan bo ZIP.
-          2. Bam START-AUTOQUEST.bat.
-          3. QLTK Manager se mo. Mo mot tai khoan NRO de test.
-          4. Launcher tu dong tim client cua QLTK trong %%TEMP%%\cuongle4399\mod 244
-             va thay Assembly-CSharp.dll bang ban Auto Quest.
-          5. Ban goc duoc backup thanh Assembly-CSharp.dll.autoquest-original.bak.
-
-          DU LIEU AUTO QUEST:
-          Data\AutoQuest\quest_profiles.json
-          Data\AutoQuest\quest_learning.log
-
-          Neu lan dau QLTK chua tao client, hay mo/start mot acc roi chay lai START-AUTOQUEST.bat.
-          Khong can tu copy DLL.
-          '@ | Set-Content -Encoding UTF8 "package/README-TEST.txt"
-
-          @"
-          Branch: $env:GITHUB_REF_NAME
-          Commit: $env:GITHUB_SHA
-          Run: $env:GITHUB_RUN_NUMBER
-          Built: $(Get-Date -Format o)
-          "@ | Set-Content -Encoding UTF8 "package/BUILD-INFO.txt"
-
-      - name: Validate package
-        shell: pwsh
-        run: |
-          $required = @(
-            'package/START-AUTOQUEST.bat',
-            'package/Start-AutoQuest.ps1',
-            'package/AutoQuest-Mod/Assembly-CSharp.dll',
-            'package/README-TEST.txt'
-          )
-          foreach ($item in $required) {
-            if (-not (Test-Path $item)) { throw "Missing package file: $item" }
-          }
-          $managerExe = Get-ChildItem 'package/Manager' -Filter '*.exe' -File | Select-Object -First 1
-          if (-not $managerExe) { throw 'Manager executable missing from final package.' }
-
-      - name: Upload ready-to-test ZIP
+      - name: Upload fallback package
         uses: actions/upload-artifact@v4
         with:
-          name: AutoQuest-READY-TO-TEST-${{ github.run_number }}
+          name: AutoQuest-QLTK-FALLBACK-${{ github.run_number }}
           path: package/
           if-no-files-found: error
           retention-days: 14
